@@ -1,0 +1,32 @@
+services:
+  restauracion-gps:
+    build: .
+    image: restauracion-gps:latest
+    container_name: restauracion-gps
+    restart: unless-stopped
+    # Todas las credenciales vienen del archivo .env (no se comitea). Ver .env.example.
+    env_file: .env
+    environment:
+      - TZ=America/Lima
+      - Restauracion__DirectorioTemporal=/data/tmp
+    ports:
+      - "3009:8080"
+    volumes:
+      # Descargas temporales de R2 (150-450 MB por archivo). Se borran tras cada tabla.
+      - restauracion-tmp:/data/tmp
+    networks:
+      - app-net
+    # Da tiempo a cancelar el proceso mysql en curso al detener el contenedor.
+    stop_grace_period: 45s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+volumes:
+  restauracion-tmp:
+
+networks:
+  app-net:
+    external: true

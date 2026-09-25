@@ -1,0 +1,56 @@
+namespace RestauracionGps.Configuracion;
+
+public sealed class R2Options
+{
+    public const string Seccion = "R2";
+
+    public string ServiceUrl { get; set; } = "";
+    public string AccessKeyId { get; set; } = "";
+    public string SecretAccessKey { get; set; } = "";
+    public string Bucket { get; set; } = "data-semanal";
+    public string Region { get; set; } = "auto";
+
+    /// <summary>Intentos totales de descarga por archivo (incluye el primero).</summary>
+    public int IntentosDescarga { get; set; } = 4;
+}
+
+public sealed class RestauracionOptions
+{
+    public const string Seccion = "Restauracion";
+
+    /// <summary>Valor esperado en el header X-Api-Key.</summary>
+    public string ApiKey { get; set; } = "";
+
+    /// <summary>Carpeta donde se descargan los .sql.gz (montar como volumen).</summary>
+    public string DirectorioTemporal { get; set; } = "/data/tmp";
+
+    /// <summary>Espacio libre mínimo en disco antes de descargar cada archivo.</summary>
+    public double EspacioMinimoGb { get; set; } = 5;
+
+    /// <summary>Rango máximo permitido entre "desde" y "hasta" (inclusive).</summary>
+    public int RangoMaximoDias { get; set; } = 62;
+
+    /// <summary>Máximo de placas por solicitud.</summary>
+    public int MaximoPlacas { get; set; } = 200;
+
+    /// <summary>Base scratch donde se importan los dumps.</summary>
+    public string BaseScratch { get; set; } = "restore_tmp";
+
+    /// <summary>Minutos estimados por tabla (solo para el campo estimadoMinutos).</summary>
+    public int MinutosPorTabla { get; set; } = 4;
+
+    /// <summary>Tiempo máximo del proceso zcat | mysql por tabla.</summary>
+    public int TimeoutImportacionMinutos { get; set; } = 90;
+
+    /// <summary>Tiempo máximo del INSERT ... SELECT por tabla.</summary>
+    public int TimeoutInsertSegundos { get; set; } = 1800;
+
+    /// <summary>Ejecutable del cliente MySQL dentro del contenedor.</summary>
+    public string MysqlCliente { get; set; } = "mysql";
+
+    /// <summary>Argumentos extra para el cliente mysql (ej. "--skip-ssl" o "--ssl").</summary>
+    public string MysqlArgsExtra { get; set; } = "";
+
+    /// <summary>Cantidad por defecto de trabajos en GET /api/restauracion.</summary>
+    public int ListadoPorDefecto { get; set; } = 20;
+}
