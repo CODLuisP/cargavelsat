@@ -16,8 +16,8 @@ public sealed class TrabajosRepositorio(Conexiones conexiones)
         CREATE TABLE IF NOT EXISTS restauraciones (
           id            VARCHAR(16)  NOT NULL,
           placas        TEXT         NOT NULL,
-          desde         DATE         NOT NULL,
-          hasta         DATE         NOT NULL,
+          desde         VARCHAR(19)  NOT NULL COMMENT 'yyyy-MM-dd o yyyy-MM-ddTHH:mm:ss, hora Lima',
+          hasta         VARCHAR(19)  NOT NULL COMMENT 'yyyy-MM-dd o yyyy-MM-ddTHH:mm:ss, hora Lima',
           ts_desde      BIGINT       NOT NULL,
           ts_hasta      BIGINT       NOT NULL,
           solicitante   VARCHAR(150) NULL,
@@ -53,7 +53,7 @@ public sealed class TrabajosRepositorio(Conexiones conexiones)
         """;
 
     private const string ColumnasTrabajo = """
-        id AS Id, placas AS PlacasJson, desde AS Desde, hasta AS Hasta,
+        id AS Id, placas AS PlacasJson, CAST(desde AS CHAR) AS Desde, CAST(hasta AS CHAR) AS Hasta,
         ts_desde AS TsDesde, ts_hasta AS TsHasta, solicitante AS Solicitante,
         estado AS Estado, tabla_actual AS TablaActual, error AS Error,
         creado AS Creado, inicio AS Inicio, fin AS Fin
@@ -71,6 +71,19 @@ public sealed class TrabajosRepositorio(Conexiones conexiones)
         await using var cn = await conexiones.AbrirDbv16Async(ct);
         await cn.ExecuteAsync(new CommandDefinition(DdlTrabajos, cancellationToken: ct));
         await cn.ExecuteAsync(new CommandDefinition(DdlDetalle, cancellationToken: ct));
+
+        // Versiones anteriores guardaban desde/hasta como DATE (sin hora). Los valores
+        // existentes se convierten solos a 'yyyy-MM-dd', que sigue siendo un formato válido.
+        var tipo = await cn.ExecuteScalarAsync<string?>(new CommandDefinition("""
+            SELECT DATA_TYPE FROM information_schema.columns
+             WHERE table_schema = DATABASE() AND table_name = 'restauraciones' AND column_name = 'desde'
+            """, cancellationToken: ct));
+        if (string.Equals(tipo, "date", StringComparison.OrdinalIgnoreCase))
+            await cn.ExecuteAsync(new CommandDefinition("""
+                ALTER TABLE restauraciones
+                  MODIFY desde VARCHAR(19) NOT NULL COMMENT 'yyyy-MM-dd o yyyy-MM-ddTHH:mm:ss, hora Lima',
+                  MODIFY hasta VARCHAR(19) NOT NULL COMMENT 'yyyy-MM-dd o yyyy-MM-ddTHH:mm:ss, hora Lima'
+                """, cancellationToken: ct));
     }
 
     /// <summary>Inserta el trabajo y sus tablas. Asigna un id corto único.</summary>
@@ -92,8 +105,8 @@ public sealed class TrabajosRepositorio(Conexiones conexiones)
                     {
                         t.Id,
                         Placas = JsonSerializer.Serialize(t.Placas),
-                        Desde = t.Desde.ToDateTime(TimeOnly.MinValue),
-                        Hasta = t.Hasta.ToDateTime(TimeOnly.MinValue),
+                        t.Desde,
+                        t.Hasta,
                         t.TsDesde,
                         t.TsHasta,
                         t.Solicitante,
@@ -259,8 +272,8 @@ public sealed class TrabajosRepositorio(Conexiones conexiones)
     {
         public string Id { get; set; } = "";
         public string PlacasJson { get; set; } = "[]";
-        public DateTime Desde { get; set; }
-        public DateTime Hasta { get; set; }
+        public string Desde { get; set; } = "";
+        public string Hasta { get; set; } = "";
         public long TsDesde { get; set; }
         public long TsHasta { get; set; }
         public string? Solicitante { get; set; }
@@ -275,8 +288,8 @@ public sealed class TrabajosRepositorio(Conexiones conexiones)
         {
             Id = Id,
             Placas = LeerPlacas(PlacasJson),
-            Desde = DateOnly.FromDateTime(Desde),
-            Hasta = DateOnly.FromDateTime(Hasta),
+            Desde = Desde,
+            Hasta = Hasta,
             TsDesde = TsDesde,
             TsHasta = TsHasta,
             Solicitante = Solicitante,

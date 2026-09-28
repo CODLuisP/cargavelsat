@@ -120,10 +120,36 @@ Responde **202 Accepted** de inmediato; el trabajo corre en segundo plano:
 }
 ```
 
+También se puede pedir un rango con hora, por ejemplo el 27/09 de 08:00 a 18:30:
+
+```bash
+curl -s -X POST "$API/api/restauracion" \
+  -H "X-Api-Key: $KEY" -H "Content-Type: application/json" \
+  -d '{
+        "placas": ["ABC123"],
+        "desde": "2025-09-27T08:00",
+        "hasta": "2025-09-27T18:30",
+        "solicitante": "jperez - ticket 4530"
+      }'
+```
+
+Formatos aceptados en `desde` y `hasta` (siempre en hora **America/Lima**; se pueden combinar):
+
+| Valor | `desde` se interpreta como | `hasta` se interpreta como |
+|---|---|---|
+| `2025-06-29` (solo fecha) | `2025-06-29 00:00:00` | `2025-06-29 23:59:59` |
+| `2025-06-29T08:30` | `2025-06-29 08:30:00` | `2025-06-29 08:30:00` |
+| `2025-06-29T08:30:00` | `2025-06-29 08:30:00` | `2025-06-29 08:30:00` |
+
+Solo cuando viene sin hora se completa a 00:00:00 / 23:59:59; si trae hora se respeta tal cual
+(`"hasta": "2025-06-30T18:30"` termina a las 18:30:00, no al final del día). No se aceptan otros
+formatos (espacio en lugar de `T`, `dd/MM/yyyy`, zona horaria `Z` u offset).
+
 Reglas:
 
-- `desde` → 00:00:00 y `hasta` → 23:59:59 de ese día, en hora **America/Lima**.
-- Fechas en formato `yyyy-MM-dd`, `desde <= hasta`, rango máximo `Restauracion__RangoMaximoDias` (62 por defecto).
+- `desde` debe ser estrictamente anterior a `hasta`.
+- La duración (`hasta - desde`) no puede superar `Restauracion__RangoMaximoDias` (62 días por defecto).
+  Con fechas sin hora, eso equivale a un máximo de 62 días calendario (p. ej. `2025-01-01` a `2025-03-03`).
 - Al menos una placa (se quitan espacios y duplicados). `deviceID` = placa.
 - Si el rango no tiene periodos en `gts.historicos` → **422**.
 - Errores de validación → **400** `{"error": "..."}`. API key incorrecta → **401**.
@@ -154,6 +180,9 @@ curl -s "$API/api/restauracion/a1b2c3d4" -H "X-Api-Key: $KEY"
   ]
 }
 ```
+
+`desde` y `hasta` se devuelven como se pidieron (hora Lima): `"2025-03-01"` si vinieron sin hora, o
+`"2025-09-27T08:00:00"` si trajeron hora. El listado usa el mismo formato.
 
 Estados del **trabajo**: `EN_COLA`, `PROCESANDO`, `OK`, `PARCIAL` (algunas tablas fallaron), `ERROR` (fallaron todas).
 

@@ -1,3 +1,5 @@
+using System.Globalization;
+
 namespace RestauracionGps.Infraestructura;
 
 /// <summary>
@@ -25,6 +27,33 @@ public static class HoraLima
 
     /// <summary>Epoch de las 23:59:59 del día, hora Lima.</summary>
     public static long FinDelDia(DateOnly dia) => AEpoch(dia.ToDateTime(new TimeOnly(23, 59, 59)));
+
+    private static readonly string[] FormatosConHora = ["yyyy-MM-dd'T'HH:mm", "yyyy-MM-dd'T'HH:mm:ss"];
+
+    /// <summary>
+    /// Lee una fecha de la API en hora Lima. Acepta "yyyy-MM-dd", "yyyy-MM-ddTHH:mm" y "yyyy-MM-ddTHH:mm:ss".
+    /// Sin hora se completa a 00:00:00 (inicio) o 23:59:59 (fin, <paramref name="esFin"/>); con hora se usa tal cual.
+    /// <paramref name="normalizada"/> es "yyyy-MM-dd" si vino sin hora, o "yyyy-MM-ddTHH:mm:ss" si trajo hora.
+    /// </summary>
+    public static bool TryLeerFecha(string? texto, bool esFin, out long epoch, out string normalizada)
+    {
+        var ci = CultureInfo.InvariantCulture;
+        if (DateOnly.TryParseExact(texto, "yyyy-MM-dd", ci, DateTimeStyles.None, out var dia))
+        {
+            epoch = esFin ? FinDelDia(dia) : InicioDelDia(dia);
+            normalizada = dia.ToString("yyyy-MM-dd", ci);
+            return true;
+        }
+        if (DateTime.TryParseExact(texto, FormatosConHora, ci, DateTimeStyles.None, out var fechaHora))
+        {
+            epoch = AEpoch(fechaHora);
+            normalizada = fechaHora.ToString("yyyy-MM-dd'T'HH:mm:ss", ci);
+            return true;
+        }
+        epoch = 0;
+        normalizada = "";
+        return false;
+    }
 
     private static long AEpoch(DateTime local)
     {

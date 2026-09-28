@@ -1,4 +1,3 @@
-using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using Microsoft.Extensions.Options;
@@ -57,17 +56,16 @@ public static class Endpoints
         var invalida = placas.FirstOrDefault(p => p.Length > 32);
         if (invalida is not null) return Error($"Placa inválida (máx. 32 caracteres): '{invalida}'");
 
-        // Fechas
-        if (!DateOnly.TryParseExact(req.Desde, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var desde))
-            return Error("'desde' debe tener formato yyyy-MM-dd");
-        if (!DateOnly.TryParseExact(req.Hasta, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var hasta))
-            return Error("'hasta' debe tener formato yyyy-MM-dd");
-        if (desde > hasta) return Error("'desde' no puede ser mayor que 'hasta'");
-        var dias = hasta.DayNumber - desde.DayNumber + 1;
-        if (dias > opt.RangoMaximoDias) return Error($"El rango es de {dias} días; el máximo es {opt.RangoMaximoDias}");
-
-        var tsDesde = HoraLima.InicioDelDia(desde);
-        var tsHasta = HoraLima.FinDelDia(hasta);
+        // Fechas: sin hora se completa a 00:00:00 / 23:59:59; con hora se respeta tal cual.
+        const string formatos = "yyyy-MM-dd, yyyy-MM-ddTHH:mm o yyyy-MM-ddTHH:mm:ss";
+        if (!HoraLima.TryLeerFecha(req.Desde, esFin: false, out var tsDesde, out var desde))
+            return Error($"'desde' tiene un formato inválido; se acepta {formatos}");
+        if (!HoraLima.TryLeerFecha(req.Hasta, esFin: true, out var tsHasta, out var hasta))
+            return Error($"'hasta' tiene un formato inválido; se acepta {formatos}");
+        if (tsDesde >= tsHasta) return Error("'desde' debe ser anterior a 'hasta'");
+        var duracion = TimeSpan.FromSeconds(tsHasta - tsDesde);
+        if (duracion > TimeSpan.FromDays(opt.RangoMaximoDias))
+            return Error($"El rango dura {(int)duracion.TotalDays} días y {duracion:hh\\:mm\\:ss}; el máximo es {opt.RangoMaximoDias} días");
 
         // Periodos
         var periodos = await gps.PeriodosAsync(tsDesde, tsHasta, ct);

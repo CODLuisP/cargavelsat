@@ -35,8 +35,10 @@ public sealed class Trabajo
 {
     public string Id { get; set; } = "";
     public List<string> Placas { get; set; } = new();
-    public DateOnly Desde { get; set; }
-    public DateOnly Hasta { get; set; }
+    /// <summary>Tal como se pidió, normalizado: "yyyy-MM-dd" o "yyyy-MM-ddTHH:mm:ss" (hora Lima).</summary>
+    public string Desde { get; set; } = "";
+    /// <summary>Tal como se pidió, normalizado: "yyyy-MM-dd" o "yyyy-MM-ddTHH:mm:ss" (hora Lima).</summary>
+    public string Hasta { get; set; } = "";
     public long TsDesde { get; set; }
     public long TsHasta { get; set; }
     public string? Solicitante { get; set; }
