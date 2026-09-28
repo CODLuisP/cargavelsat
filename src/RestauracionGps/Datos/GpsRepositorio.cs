@@ -143,6 +143,10 @@ public sealed partial class GpsRepositorio(Conexiones conexiones)
               DROP PRIMARY KEY,
               DROP INDEX idx_timestamp_account_device
             """, cancellationToken: ct));
+        // MyISAM acelera la carga (sin transacciones ni redo log). Se cambia con la tabla vacía,
+        // donde es instantáneo; la tabla es de un solo uso y el destino en dbv16_01 sigue en InnoDB.
+        await cn.ExecuteAsync(new CommandDefinition(
+            $"ALTER TABLE `{baseScratch}`.`{tabla}` ENGINE = MyISAM", cancellationToken: ct));
     }
 
     /// <summary>Tablas gps_* que quedaron en la base scratch (por ejemplo tras un reinicio).</summary>

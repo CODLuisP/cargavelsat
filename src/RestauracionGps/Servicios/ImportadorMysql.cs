@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.IO.Compression;
 using System.Text;
 using Microsoft.Extensions.Options;
+using MySqlConnector;
 using RestauracionGps.Configuracion;
 using RestauracionGps.Datos;
 
@@ -9,7 +10,8 @@ namespace RestauracionGps.Servicios;
 
 /// <summary>
 /// Importa un dump .sql.gz en la base scratch ejecutando
-/// <c>gzip -dc archivo | mysql ... restore_tmp</c> como proceso externo.
+/// <c>gzip -dc archivo | mysql ... restore_tmp</c> como proceso externo (con
+/// "SET SESSION sql_log_bin = 0" antepuesto si el usuario tiene permiso).
 /// El SQL del dump no se modifica.
 /// </summary>
 public sealed class ImportadorMysql(
@@ -22,6 +24,7 @@ public sealed class ImportadorMysql(
     public async Task ImportarAsync(string archivoGz, string baseScratch, CancellationToken ct)
     {
         VerificarQueNoCambiaDeBase(archivoGz);
+        var sinBinlog = await PuedeDesactivarBinlogAsync(ct);
 
         var cs = conexiones.DatosDbv16();
         var psi = new ProcessStartInfo("bash")
@@ -30,11 +33,15 @@ public sealed class ImportadorMysql(
             RedirectStandardOutput = true,
             UseShellExecute = false
         };
-        // Los valores van como argumentos posicionales ($0..$4) para no interpolarlos en el script.
+        // Los valores van como argumentos posicionales ($0..$5) para no interpolarlos en el script.
+        // Con permiso, se antepone "SET SESSION sql_log_bin = 0" al dump: solo afecta a esta sesión.
         var extra = string.IsNullOrWhiteSpace(_opt.MysqlArgsExtra) ? "" : " " + _opt.MysqlArgsExtra.Trim();
+        var entrada = sinBinlog
+            ? "{ printf 'SET SESSION sql_log_bin = 0;\\n'; gzip -dc -- \"$0\"; }"
+            : "gzip -dc -- \"$0\"";
         psi.ArgumentList.Add("-c");
         psi.ArgumentList.Add(
-            "set -o pipefail; gzip -dc -- \"$0\" | \"$1\" --host=\"$2\" --port=\"$3\" --user=\"$4\" " +
+            $"set -o pipefail; {entrada} | \"$1\" --host=\"$2\" --port=\"$3\" --user=\"$4\" " +
             $"--default-character-set=utf8mb4 --max-allowed-packet=1073741824{extra} \"$5\"");
         psi.ArgumentList.Add(archivoGz);
         psi.ArgumentList.Add(_opt.MysqlCliente);
@@ -86,8 +93,36 @@ public sealed class ImportadorMysql(
 
         var avisos = stderr.Texto();
         if (avisos.Length > 0) log.LogWarning("Salida de error de mysql (código 0): {Salida}", avisos);
-        log.LogInformation("Importación de {Archivo} en {Base} terminada en {Seg:F0}s",
-            Path.GetFileName(archivoGz), baseScratch, sw.Elapsed.TotalSeconds);
+        log.LogInformation("Importación de {Archivo} en {Base} terminada en {Seg:F0}s (binlog {Binlog})",
+            Path.GetFileName(archivoGz), baseScratch, sw.Elapsed.TotalSeconds, sinBinlog ? "desactivado" : "activo");
+    }
+
+    /// <summary>
+    /// Prueba "SET SESSION sql_log_bin = 0" en una conexión aparte. Si el cliente mysql la
+    /// ejecutara sin permiso, abortaría todo el dump; por eso solo se antepone cuando se sabe
+    /// que funciona. Requiere SESSION_VARIABLES_ADMIN (o SUPER); sin él se importa con binlog.
+    /// </summary>
+    private async Task<bool> PuedeDesactivarBinlogAsync(CancellationToken ct)
+    {
+        try
+        {
+            await using var cn = await conexiones.AbrirDbv16Async(ct);
+            await using var cmd = cn.CreateCommand();
+            cmd.CommandText = "SET SESSION sql_log_bin = 0; SET SESSION sql_log_bin = 1;";
+            await cmd.ExecuteNonQueryAsync(ct);
+            return true;
+        }
+        catch (MySqlException ex) when (ex.ErrorCode == MySqlErrorCode.SpecifiedAccessDeniedError)
+        {
+            log.LogWarning("Sin permiso para SET SESSION sql_log_bin = 0 ({Mensaje}); se importa con binlog. " +
+                           "Ver README: GRANT SESSION_VARIABLES_ADMIN", ex.Message);
+            return false;
+        }
+        catch (MySqlException ex)
+        {
+            log.LogWarning(ex, "No se pudo probar SET SESSION sql_log_bin = 0; se importa con binlog");
+            return false;
+        }
     }
 
     /// <summary>

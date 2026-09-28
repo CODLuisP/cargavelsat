@@ -51,6 +51,20 @@ Además `gtsuser` necesita (normalmente ya los tiene):
 - `SELECT` en `gts.historicos` y `gts.eventdata` (para `CREATE TABLE ... LIKE gts.eventdata`).
 - `CREATE`, `INSERT`, `SELECT`, `UPDATE` en `dbv16_01`.
 
+**Opcional (recomendado): importar sin binlog.** El servidor usa `binlog_format=ROW`, así que cada fila
+importada en `restore_tmp` se escribe también al binlog, lo cual es trabajo inútil para una tabla temporal.
+Si `gtsuser` tiene este permiso, cada importación ejecuta `SET SESSION sql_log_bin = 0`, que solo afecta
+a esa sesión (no a la configuración global ni a otras conexiones). Como root:
+
+```sql
+GRANT SESSION_VARIABLES_ADMIN ON *.* TO 'gtsuser'@'%';
+FLUSH PRIVILEGES;
+```
+
+Sin el permiso todo funciona igual, pero se importa con binlog y el log muestra en cada tabla el aviso
+`Sin permiso para SET SESSION sql_log_bin = 0`. No hace falta reiniciar el servicio después del `GRANT`:
+se vuelve a comprobar en cada importación.
+
 Al arrancar, el servicio crea sus propias tablas de estado en `dbv16_01`:
 
 | Tabla | Contenido |
@@ -227,8 +241,10 @@ Devuelve **503** si MySQL no responde o el servicio aún no terminó de iniciali
    3. Crea `restore_tmp.{tabla}` vacía (`LIKE gts.eventdata`) **sin llave primaria ni índices**.
       Los dumps cargados desde MySQL 5.6 (todo 2025 y enero–mayo 2026) no traen `CREATE TABLE` y tienen
       filas duplicadas; así importan igual. Si el dump trae su propio `CREATE TABLE`, reemplaza esta tabla.
+      Con la tabla aún vacía la pasa a `ENGINE = MyISAM` (instantáneo), que carga más rápido que InnoDB.
    4. Revisa que el dump no tenga `USE`/`CREATE DATABASE` (escribiría fuera de `restore_tmp`) e importa:
-      `gzip -dc archivo | mysql ... restore_tmp`. El SQL del dump no se modifica.
+      `gzip -dc archivo | mysql ... restore_tmp`. El SQL del dump no se modifica; si `gtsuser` tiene
+      `SESSION_VARIABLES_ADMIN` se antepone `SET SESSION sql_log_bin = 0` (ver sección 2).
    5. `CREATE TABLE IF NOT EXISTS dbv16_01.{tabla} LIKE gts.eventdata`.
    6. `INSERT IGNORE INTO dbv16_01.{tabla} (...) SELECT ... FROM restore_tmp.{tabla} WHERE deviceID IN (...) AND timestamp BETWEEN desde AND hasta`. Aquí se descartan los duplicados del dump.
       (usa las columnas comunes entre el dump y `eventdata`, por si algún dump antiguo difiere; lo avisa en el log).
@@ -251,6 +267,7 @@ Cada paso queda registrado con su tiempo, por ejemplo:
 ```
 2026-09-23 22:10:00 info: ...TrabajadorRestauracion[0] [a1b2c3d4] Inicio. Solicitante=jperez Placas=[ABC123,XYZ789] Rango=2025-03-01..2025-03-15 ...
 2026-09-23 22:11:32 info: ...Restaurador[0] [a1b2c3d4] gps_20250301: descargado 312.4 MB en 92s
+2026-09-23 22:13:40 info: ...ImportadorMysql[0] Importación de a1b2c3d4_gps_20250301.sql.gz en restore_tmp terminada en 128s (binlog desactivado)
 2026-09-23 22:13:40 info: ...Restaurador[0] [a1b2c3d4] gps_20250301: importado en restore_tmp en 128s
 2026-09-23 22:14:00 info: ...Restaurador[0] [a1b2c3d4] gps_20250301: 48213 filas insertadas en 20s
 2026-09-23 22:14:00 info: ...TrabajadorRestauracion[0] [a1b2c3d4] gps_20250301: OK, 48213 filas en 240s
