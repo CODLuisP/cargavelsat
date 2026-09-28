@@ -123,6 +123,28 @@ public sealed partial class GpsRepositorio(Conexiones conexiones)
             $"DROP TABLE IF EXISTS `{baseScratch}`.`{tabla}`", cancellationToken: ct));
     }
 
+    /// <summary>
+    /// Deja lista en la base scratch una tabla vacía con la estructura de gts.eventdata, pero sin
+    /// llave primaria ni índices. Algunos dumps (los generados desde MySQL 5.6) no traen CREATE TABLE
+    /// y contienen filas duplicadas; así se importan igual. Si el dump sí trae su CREATE TABLE,
+    /// reemplaza esta tabla. Los duplicados los descarta después el INSERT IGNORE hacia el destino.
+    /// </summary>
+    public async Task PrepararTablaScratchAsync(string baseScratch, string tabla, CancellationToken ct)
+    {
+        Validar(tabla);
+        ValidarBase(baseScratch);
+        await using var cn = await conexiones.AbrirDbv16Async(ct);
+        await cn.ExecuteAsync(new CommandDefinition(
+            $"DROP TABLE IF EXISTS `{baseScratch}`.`{tabla}`", cancellationToken: ct));
+        await cn.ExecuteAsync(new CommandDefinition(
+            $"CREATE TABLE `{baseScratch}`.`{tabla}` LIKE gts.eventdata", cancellationToken: ct));
+        await cn.ExecuteAsync(new CommandDefinition($"""
+            ALTER TABLE `{baseScratch}`.`{tabla}`
+              DROP PRIMARY KEY,
+              DROP INDEX idx_timestamp_account_device
+            """, cancellationToken: ct));
+    }
+
     /// <summary>Tablas gps_* que quedaron en la base scratch (por ejemplo tras un reinicio).</summary>
     public async Task<List<string>> TablasScratchAsync(string baseScratch, CancellationToken ct)
     {

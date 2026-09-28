@@ -71,8 +71,18 @@ public sealed class ImportadorMysql(
         }
 
         if (proceso.ExitCode != 0)
+        {
+            var salida = stderr.Texto();
+            if (salida.Contains("ERROR 1136", StringComparison.Ordinal))
+            {
+                log.LogDebug("Salida de mysql: {Salida}", salida);
+                throw new InvalidOperationException(
+                    $"La estructura del dump {Path.GetFileName(archivoGz)} no coincide con gts.eventdata " +
+                    "(la cantidad de columnas de los INSERT es distinta)");
+            }
             throw new InvalidOperationException(
-                $"La importación terminó con código {proceso.ExitCode}: {stderr.Texto()}");
+                $"La importación terminó con código {proceso.ExitCode}: {salida}");
+        }
 
         var avisos = stderr.Texto();
         if (avisos.Length > 0) log.LogWarning("Salida de error de mysql (código 0): {Salida}", avisos);

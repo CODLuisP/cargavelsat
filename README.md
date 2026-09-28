@@ -195,12 +195,15 @@ Devuelve **503** si MySQL no responde o el servicio aún no terminó de iniciali
 4. Restauración de una tabla:
    1. Verifica ≥ `EspacioMinimoGb` (5 GB) libres en `/data/tmp`.
    2. Descarga `{tabla}.sql.gz` de R2 (reintentos con espera 5 s, 15 s, 45 s; no reintenta si el objeto no existe).
-   3. Revisa que el dump no tenga `USE`/`CREATE DATABASE` (escribiría fuera de `restore_tmp`) e importa:
+   3. Crea `restore_tmp.{tabla}` vacía (`LIKE gts.eventdata`) **sin llave primaria ni índices**.
+      Los dumps cargados desde MySQL 5.6 (todo 2025 y enero–mayo 2026) no traen `CREATE TABLE` y tienen
+      filas duplicadas; así importan igual. Si el dump trae su propio `CREATE TABLE`, reemplaza esta tabla.
+   4. Revisa que el dump no tenga `USE`/`CREATE DATABASE` (escribiría fuera de `restore_tmp`) e importa:
       `gzip -dc archivo | mysql ... restore_tmp`. El SQL del dump no se modifica.
-   4. `CREATE TABLE IF NOT EXISTS dbv16_01.{tabla} LIKE gts.eventdata`.
-   5. `INSERT IGNORE INTO dbv16_01.{tabla} (...) SELECT ... FROM restore_tmp.{tabla} WHERE deviceID IN (...) AND timestamp BETWEEN desde AND hasta`
+   5. `CREATE TABLE IF NOT EXISTS dbv16_01.{tabla} LIKE gts.eventdata`.
+   6. `INSERT IGNORE INTO dbv16_01.{tabla} (...) SELECT ... FROM restore_tmp.{tabla} WHERE deviceID IN (...) AND timestamp BETWEEN desde AND hasta`. Aquí se descartan los duplicados del dump.
       (usa las columnas comunes entre el dump y `eventdata`, por si algún dump antiguo difiere; lo avisa en el log).
-   6. Siempre (`finally`): `DROP TABLE restore_tmp.{tabla}` y borra el archivo temporal.
+   7. Siempre (`finally`): `DROP TABLE restore_tmp.{tabla}` y borra el archivo temporal.
 5. Si una tabla falla se registra el error y se sigue con la siguiente.
 6. Al arrancar: crea las tablas de estado, borra temporales y tablas huérfanas de `restore_tmp`
    y re-encola los trabajos `EN_COLA`/`PROCESANDO`.
@@ -266,5 +269,6 @@ Todo se lee de variables de entorno (archivo `.env`). `Seccion__Clave` equivale 
   `docker exec -it restauracion-gps bash -c 'MYSQL_PWD=... mysql -h mysql-gts -u gtsuser -e "select 1" restore_tmp'`.
 - **`No existe el objeto 'gps_XXXX.sql.gz'`**: el periodo figura en `historicos` pero aún no se subió a R2
   (por ejemplo, el periodo actual). La tabla queda en `ERROR` y el trabajo sigue con las demás.
+- **`La estructura del dump ... no coincide con gts.eventdata`**: el dump trae otra cantidad de columnas (MySQL ERROR 1136). Hay que revisar ese archivo a mano.
 - **`Espacio insuficiente`**: liberar disco en el host (el volumen `restauracion-tmp` vive en `/var/lib/docker/volumes`).
   Ojo: la importación también ocupa espacio en el servidor MySQL mientras dura.

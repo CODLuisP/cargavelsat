@@ -37,7 +37,7 @@ public sealed class Restaurador(
 
             // b. Importar en la base scratch (sin tocar el SQL del dump)
             await trabajos.ActualizarEstadoTablaAsync(trabajo.Id, t.Orden, EstadoTabla.Importando, ct);
-            await gps.EliminarTablaScratchAsync(scratch, tabla, ct);
+            await gps.PrepararTablaScratchAsync(scratch, tabla, ct);
             sw.Restart();
             await importador.ImportarAsync(archivo, scratch, ct);
             log.LogInformation("[{Job}] {Tabla}: importado en {Base} en {Seg:F0}s",
