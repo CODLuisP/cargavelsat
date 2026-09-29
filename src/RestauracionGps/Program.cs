@@ -27,6 +27,7 @@ builder.Services.AddOptions<RestauracionOptions>()
     .Bind(builder.Configuration.GetSection(RestauracionOptions.Seccion))
     .Validate(o => o.ApiKey.Length >= 16, "Restauracion:ApiKey es obligatoria (mínimo 16 caracteres)")
     .Validate(o => o.RangoMaximoDias > 0, "Restauracion:RangoMaximoDias debe ser > 0")
+    .Validate(o => o.TuplasPorLote > 0, "Restauracion:TuplasPorLote debe ser > 0")
     .ValidateOnStart();
 
 builder.Services.ConfigureHttpJsonOptions(o =>
@@ -36,14 +37,13 @@ builder.Services.AddSingleton<Conexiones>();
 builder.Services.AddSingleton<GpsRepositorio>();
 builder.Services.AddSingleton<TrabajosRepositorio>();
 builder.Services.AddSingleton<R2Descargador>();
-builder.Services.AddSingleton<ImportadorMysql>();
 builder.Services.AddSingleton<Disponibilidad>();
 builder.Services.AddSingleton<Restaurador>();
 builder.Services.AddSingleton<ColaTrabajos>();
 builder.Services.AddSingleton<EstadoServicio>();
 builder.Services.AddHostedService<TrabajadorRestauracion>();
 
-// Un trabajo en curso puede tardar en cancelarse (proceso mysql, INSERT largo).
+// Un trabajo en curso puede tardar en cancelarse (lectura del dump, INSERT largo).
 builder.Services.Configure<HostOptions>(o => o.ShutdownTimeout = TimeSpan.FromSeconds(30));
 
 var app = builder.Build();
@@ -51,7 +51,7 @@ var app = builder.Build();
 app.MapearEndpoints();
 
 var opt = app.Services.GetRequiredService<IOptions<RestauracionOptions>>().Value;
-app.Logger.LogInformation("Restauración GPS iniciando. Scratch={Scratch} Temporales={Dir} RangoMax={Dias} días",
-    opt.BaseScratch, opt.DirectorioTemporal, opt.RangoMaximoDias);
+app.Logger.LogInformation("Restauración GPS iniciando. Temporales={Dir} RangoMax={Dias} días TuplasPorLote={Lote}",
+    opt.DirectorioTemporal, opt.RangoMaximoDias, opt.TuplasPorLote);
 
 app.Run();

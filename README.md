@@ -4,9 +4,9 @@ Microservicio .NET 8 (Minimal API) que restaura data histórica de GPS desde Clo
 (bucket `data-semanal`) hacia `dbv16_01`, filtrando por placa y rango de fechas.
 
 Cuando un cliente pide data de hace más de 6 meses, la tabla `dbv16_01.gps_YYYYMMNN` ya no existe.
-El servicio descarga el dump `gps_YYYYMMNN.sql.gz`, lo importa en una base scratch (`restore_tmp`),
-copia **solo** las placas y fechas pedidas a `dbv16_01.gps_YYYYMMNN` y limpia. El cliente descarga
-luego desde la web de rastreo, como siempre.
+El servicio descarga el dump `gps_YYYYMMNN.sql.gz`, lo lee en streaming quedándose **solo** con las filas
+de las placas y fechas pedidas, las inserta en `dbv16_01.gps_YYYYMMNN` y limpia. El dump nunca se importa
+completo. El cliente descarga luego desde la web de rastreo, como siempre.
 
 > Las tablas restauradas las borra el cron de retención la madrugada siguiente. Es lo esperado.
 
@@ -25,45 +25,22 @@ src/RestauracionGps/
   Datos/                      acceso a MySQL (historicos, gps_*, estado de trabajos)
   Servicios/
     TrabajadorRestauracion.cs BackgroundService: procesa la cola, de a un trabajo y de a una tabla
-    Restaurador.cs            descarga -> importa -> crea destino -> INSERT IGNORE -> limpia
+    Restaurador.cs            descarga -> crea destino -> lee y filtra el dump -> INSERT IGNORE -> limpia
     R2Descargador.cs          descarga de R2 (S3) con reintentos
-    ImportadorMysql.cs        gzip -dc archivo | mysql restore_tmp
+    LectorDumpSql.cs          parser en streaming del .sql.gz (tuplas, comillas, escapes, verificación)
+    ArchivoTuplas.cs          archivo temporal con las tuplas aceptadas
     Disponibilidad.cs         decide si una tabla ya está disponible y se puede saltar
+tests/RestauracionGps.Tests/  tests del parser (xUnit)
 ```
 
-## 2. Preparación de MySQL (una sola vez)
+Para correr los tests: `dotnet test` (desde la raíz, con el SDK de .NET 8 o superior).
 
-Conectarse como root al contenedor `mysql-gts`:
+## 2. Permisos en MySQL
 
-```bash
-docker exec -it mysql-gts mysql -uroot -p
-```
-
-```sql
-CREATE DATABASE IF NOT EXISTS restore_tmp
-  DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
-GRANT ALL PRIVILEGES ON restore_tmp.* TO 'gtsuser'@'%';
-FLUSH PRIVILEGES;
-```
-
-Además `gtsuser` necesita (normalmente ya los tiene):
+No hace falta ninguna base auxiliar. `gtsuser` necesita (normalmente ya los tiene):
 
 - `SELECT` en `gts.historicos` y `gts.eventdata` (para `CREATE TABLE ... LIKE gts.eventdata`).
 - `CREATE`, `INSERT`, `SELECT`, `UPDATE` en `dbv16_01`.
-
-**Opcional (recomendado): importar sin binlog.** El servidor usa `binlog_format=ROW`, así que cada fila
-importada en `restore_tmp` se escribe también al binlog, lo cual es trabajo inútil para una tabla temporal.
-Si `gtsuser` tiene este permiso, cada importación ejecuta `SET SESSION sql_log_bin = 0`, que solo afecta
-a esa sesión (no a la configuración global ni a otras conexiones). Como root:
-
-```sql
-GRANT SESSION_VARIABLES_ADMIN ON *.* TO 'gtsuser'@'%';
-FLUSH PRIVILEGES;
-```
-
-Sin el permiso todo funciona igual, pero se importa con binlog y el log muestra en cada tabla el aviso
-`Sin permiso para SET SESSION sql_log_bin = 0`. No hace falta reiniciar el servicio después del `GRANT`:
-se vuelve a comprobar en cada importación.
 
 Al arrancar, el servicio crea sus propias tablas de estado en `dbv16_01`:
 
@@ -235,23 +212,47 @@ Devuelve **503** si MySQL no responde o el servicio aún no terminó de iniciali
      cada placa pedida ya se restauró antes con éxito cubriendo el rango pedido. Si no, se vuelve a
      restaurar (con `INSERT IGNORE` es seguro repetir). Así no se pierden placas/fechas nuevas cuando
      una restauración previa trajo otras.
-4. Restauración de una tabla:
+4. Restauración de una tabla (estado de la tabla entre paréntesis):
    1. Verifica ≥ `EspacioMinimoGb` (5 GB) libres en `/data/tmp`.
-   2. Descarga `{tabla}.sql.gz` de R2 (reintentos con espera 5 s, 15 s, 45 s; no reintenta si el objeto no existe).
-   3. Crea `restore_tmp.{tabla}` vacía (`LIKE gts.eventdata`) **sin llave primaria ni índices**.
-      Los dumps cargados desde MySQL 5.6 (todo 2025 y enero–mayo 2026) no traen `CREATE TABLE` y tienen
-      filas duplicadas; así importan igual. Si el dump trae su propio `CREATE TABLE`, reemplaza esta tabla.
-      Con la tabla aún vacía la pasa a `ENGINE = MyISAM` (instantáneo), que carga más rápido que InnoDB.
-   4. Revisa que el dump no tenga `USE`/`CREATE DATABASE` (escribiría fuera de `restore_tmp`) e importa:
-      `gzip -dc archivo | mysql ... restore_tmp`. El SQL del dump no se modifica; si `gtsuser` tiene
-      `SESSION_VARIABLES_ADMIN` se antepone `SET SESSION sql_log_bin = 0` (ver sección 2).
-   5. `CREATE TABLE IF NOT EXISTS dbv16_01.{tabla} LIKE gts.eventdata`.
-   6. `INSERT IGNORE INTO dbv16_01.{tabla} (...) SELECT ... FROM restore_tmp.{tabla} WHERE deviceID IN (...) AND timestamp BETWEEN desde AND hasta`. Aquí se descartan los duplicados del dump.
-      (usa las columnas comunes entre el dump y `eventdata`, por si algún dump antiguo difiere; lo avisa en el log).
-   7. Siempre (`finally`): `DROP TABLE restore_tmp.{tabla}` y borra el archivo temporal.
+   2. (`DESCARGANDO`) Descarga `{tabla}.sql.gz` de R2 (reintentos con espera 5 s, 15 s, 45 s; no reintenta
+      si el objeto no existe).
+   3. `CREATE TABLE IF NOT EXISTS dbv16_01.{tabla} LIKE gts.eventdata`, y verifica que sus columnas 2 y 3
+      sean `deviceID` y `timestamp`.
+   4. (`IMPORTANDO`) Lee el `.sql.gz` en streaming (`GZipStream`, sin cargarlo en memoria) y recorre cada
+      `INSERT INTO `{tabla}` VALUES (...),(...);`. Por cada tupla lee `deviceID` (campo 2) y `timestamp`
+      (campo 3): si la placa está entre las pedidas y el timestamp en el rango, guarda el texto de la tupla
+      **tal cual** en un archivo temporal; si no, la descarta. Ver "Cómo se leen los dumps" abajo.
+   5. (`FILTRANDO`) Inserta las tuplas guardadas con `INSERT IGNORE INTO dbv16_01.{tabla} VALUES ...` en lotes
+      de `TuplasPorLote` (500), todos en una sola transacción. La PK descarta las filas que ya existían y los
+      duplicados que traen algunos dumps.
+   6. Siempre (`finally`): borra el `.sql.gz` y el archivo de tuplas.
 5. Si una tabla falla se registra el error y se sigue con la siguiente.
-6. Al arrancar: crea las tablas de estado, borra temporales y tablas huérfanas de `restore_tmp`
-   y re-encola los trabajos `EN_COLA`/`PROCESANDO`.
+6. Al arrancar: crea las tablas de estado, borra temporales huérfanos y re-encola los trabajos
+   `EN_COLA`/`PROCESANDO`.
+
+### Cómo se leen los dumps
+
+El parser (`LectorDumpSql`) recorre el dump byte a byte llevando el estado de comillas, así que las
+direcciones con comas, paréntesis y apóstrofes (`'Av. Los Incas (Km 12), Ate'`, `'O\'Higgins'`,
+`'O''Higgins'`, `'C:\\'`) no rompen la separación de tuplas ni de campos: `),(` y `,` solo cuentan
+fuera de comillas, y `\'`, `\\` y `''` no cierran la comilla. El texto de cada tupla se reinserta sin
+reformatear, en el charset que declara el dump (`SET NAMES`), y se respeta su `SET TIME_ZONE`.
+
+Acepta los dumps con `CREATE TABLE` (los de nuestro script) y sin él (los cargados desde MySQL 5.6, que
+empiezan en `LOCK TABLES` + `INSERT` y traen filas duplicadas). También acepta `INSERT IGNORE`/`REPLACE`.
+
+**Verificación integrada.** Si algo no cuadra, la tabla se aborta con `ERROR` y un mensaje claro, **sin
+insertar nada** (primero se valida el dump completo y recién después se inserta):
+
+- cada tupla debe empezar con `(`, terminar con `)` y estar seguida de `,` o `;`;
+- cada tupla debe tener exactamente tantos campos como columnas tiene `gts.eventdata` (si no, la estructura
+  del dump no coincide);
+- `deviceID` debe ser una cadena y `timestamp` un entero;
+- el archivo debe terminar fuera de toda sentencia y comilla (si no, está truncado);
+- no se aceptan `INSERT` con lista de columnas (`mysqldump --complete-insert`) ni charsets desconocidos.
+
+El log registra por tabla: tuplas totales leídas, tuplas que pasaron el filtro, filas insertadas y el
+tiempo de cada fase.
 
 ## 6. Logs
 
@@ -267,11 +268,13 @@ Cada paso queda registrado con su tiempo, por ejemplo:
 ```
 2026-09-23 22:10:00 info: ...TrabajadorRestauracion[0] [a1b2c3d4] Inicio. Solicitante=jperez Placas=[ABC123,XYZ789] Rango=2025-03-01..2025-03-15 ...
 2026-09-23 22:11:32 info: ...Restaurador[0] [a1b2c3d4] gps_20250301: descargado 312.4 MB en 92s
-2026-09-23 22:13:40 info: ...ImportadorMysql[0] Importación de a1b2c3d4_gps_20250301.sql.gz en restore_tmp terminada en 128s (binlog desactivado)
-2026-09-23 22:13:40 info: ...Restaurador[0] [a1b2c3d4] gps_20250301: importado en restore_tmp en 128s
-2026-09-23 22:14:00 info: ...Restaurador[0] [a1b2c3d4] gps_20250301: 48213 filas insertadas en 20s
-2026-09-23 22:14:00 info: ...TrabajadorRestauracion[0] [a1b2c3d4] gps_20250301: OK, 48213 filas en 240s
+2026-09-23 22:11:52 info: ...Restaurador[0] [a1b2c3d4] gps_20250301: leídos 1.0 GB, 1402311 tuplas, 812 aceptadas
+2026-09-23 22:12:09 info: ...Restaurador[0] [a1b2c3d4] gps_20250301: dump leído en 37s (2104 MB descomprimidos, 57 MB/s). Sentencias INSERT: 2210. Tuplas totales: 2951877. Pasaron el filtro: 1578. Charset: utf8mb4. Zona: +00:00
+2026-09-23 22:12:10 info: ...Restaurador[0] [a1b2c3d4] gps_20250301: 1578 filas insertadas en 0.6s (0 de 1578 ya existían o eran duplicadas)
+2026-09-23 22:12:10 info: ...TrabajadorRestauracion[0] [a1b2c3d4] gps_20250301: OK, 1578 filas en 130s
 ```
+
+(Los números del ejemplo son ilustrativos.)
 
 La rotación está configurada en `docker-compose.yml` (5 archivos de 20 MB). El historial de trabajos
 también se puede consultar en MySQL:
@@ -290,31 +293,47 @@ Todo se lee de variables de entorno (archivo `.env`). `Seccion__Clave` equivale 
 | Variable | Defecto | Descripción |
 |---|---|---|
 | `ConnectionStrings__Gts` | — | Conexión a `gts` |
-| `ConnectionStrings__Dbv16` | — | Conexión a `dbv16_01` (también la usa el cliente `mysql` para importar) |
+| `ConnectionStrings__Dbv16` | — | Conexión a `dbv16_01` |
 | `R2__ServiceUrl`, `R2__AccessKeyId`, `R2__SecretAccessKey` | — | Credenciales de R2 |
 | `R2__Bucket` / `R2__Region` | `data-semanal` / `auto` | |
 | `R2__IntentosDescarga` | 4 | Intentos por archivo |
 | `Restauracion__ApiKey` | — | Valor del header `X-Api-Key` (mín. 16 caracteres) |
 | `Restauracion__RangoMaximoDias` | 62 | |
 | `Restauracion__EspacioMinimoGb` | 5 | Espacio libre mínimo antes de cada descarga |
-| `Restauracion__BaseScratch` | `restore_tmp` | |
 | `Restauracion__MinutosPorTabla` | 4 | Solo para `estimadoMinutos` |
-| `Restauracion__TimeoutImportacionMinutos` | 90 | Límite del `gzip \| mysql` por tabla |
-| `Restauracion__TimeoutInsertSegundos` | 1800 | Límite del `INSERT ... SELECT` |
-| `Restauracion__MysqlArgsExtra` | vacío | Argumentos extra para el cliente `mysql` |
+| `Restauracion__TuplasPorLote` | 500 | Tuplas por `INSERT IGNORE` al insertar lo filtrado |
+| `Restauracion__TimeoutInsertSegundos` | 1800 | Límite de cada lote `INSERT` |
 | `Restauracion__MaximoPlacas` | 200 | |
 
 ## 8. Problemas frecuentes
 
-- **`La base scratch 'restore_tmp' no existe`**: falta el paso 2.
 - **`Unknown MySQL server host 'mysql-gts'`**: el contenedor no está en la red `app-net`.
-- **Error de autenticación del cliente `mysql` al importar** (p. ej. `caching_sha2_password`):
-  `default-mysql-client` en Debian 12 es el cliente de MariaDB. Si `gtsuser` usa `caching_sha2_password`,
-  probar con `Restauracion__MysqlArgsExtra=--ssl` en `.env`, o cambiar el usuario a
-  `mysql_native_password`. Para probar a mano dentro del contenedor:
-  `docker exec -it restauracion-gps bash -c 'MYSQL_PWD=... mysql -h mysql-gts -u gtsuser -e "select 1" restore_tmp'`.
 - **`No existe el objeto 'gps_XXXX.sql.gz'`**: el periodo figura en `historicos` pero aún no se subió a R2
   (por ejemplo, el periodo actual). La tabla queda en `ERROR` y el trabajo sigue con las demás.
-- **`La estructura del dump ... no coincide con gts.eventdata`**: el dump trae otra cantidad de columnas (MySQL ERROR 1136). Hay que revisar ese archivo a mano.
+- **`... la estructura del dump no coincide con gts.eventdata`**: las tuplas del dump tienen otra cantidad
+  de campos que las columnas de `gts.eventdata`. No se insertó nada; hay que revisar ese archivo a mano.
+- **`Dump de gps_XXXX malformado ...` / `terminó dentro de una comilla` / `terminó en medio de una sentencia
+  INSERT`**: el archivo está truncado o tiene un formato inesperado. El mensaje indica la tupla y el byte
+  (del archivo descomprimido) donde se detectó. No se insertó nada.
 - **`Espacio insuficiente`**: liberar disco en el host (el volumen `restauracion-tmp` vive en `/var/lib/docker/volumes`).
-  Ojo: la importación también ocupa espacio en el servidor MySQL mientras dura.
+
+## 9. Verificación al desplegar
+
+Conteos exactos medidos con el método anterior (importación completa) para `gps_20250605`. El método
+actual debe devolver exactamente los mismos `filasInsertadas`, sobre una tabla que no exista todavía en
+`dbv16_01` (si existe con esas filas, `INSERT IGNORE` insertará 0 y la tabla puede salir `OMITIDA`):
+
+| Placa | Rango | Filas |
+|---|---|---|
+| `bam-754` | `2025-06-29` a `2025-06-30` | 2,172 |
+| `c4b-849` | `2025-06-29` a `2025-06-30` | 1,975 |
+| `aar-555` | `2025-06-29` a `2025-06-30` | 139 |
+| `h1k-422` | `2025-06-29T08:00` a `2025-06-29T12:00` | 11 |
+
+```bash
+curl -s -X POST "$API/api/restauracion" -H "X-Api-Key: $KEY" -H "Content-Type: application/json" \
+  -d '{"placas":["bam-754"],"desde":"2025-06-29","hasta":"2025-06-30","solicitante":"verificacion"}'
+```
+
+Comparar con `filasInsertadas` de la fila `gps_20250605` en el `detalle` del trabajo. En el log, la línea
+`dump leído en ...` muestra también las tuplas totales y las que pasaron el filtro.

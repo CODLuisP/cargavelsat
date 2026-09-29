@@ -1,15 +1,17 @@
+using System.Text;
 using System.Text.RegularExpressions;
 using Dapper;
+using MySqlConnector;
 using RestauracionGps.Dominio;
 
 namespace RestauracionGps.Datos;
 
-/// <summary>Consultas sobre gts.historicos, las tablas gps_* de dbv16_01 y la base scratch.</summary>
+/// <summary>Consultas sobre gts.historicos y las tablas gps_* de dbv16_01.</summary>
 public sealed partial class GpsRepositorio(Conexiones conexiones)
 {
     /// <summary>
-    /// Los nombres de tabla se interpolan en SQL (no pueden ir como parámetro) y en la
-    /// línea de comandos, así que solo se aceptan nombres con el formato esperado.
+    /// Los nombres de tabla se interpolan en SQL (no pueden ir como parámetro),
+    /// así que solo se aceptan nombres con el formato esperado.
     /// </summary>
     [GeneratedRegex(@"^gps_\d{8}$")]
     private static partial Regex RegexTabla();
@@ -21,9 +23,6 @@ public sealed partial class GpsRepositorio(Conexiones conexiones)
 
     private static string Validar(string tabla) =>
         NombreTablaValido(tabla) ? tabla : throw new InvalidOperationException($"Nombre de tabla inválido: '{tabla}'");
-
-    private static string ValidarBase(string db) =>
-        Regex.IsMatch(db, @"^[A-Za-z0-9_]+$") ? db : throw new InvalidOperationException($"Nombre de base inválido: '{db}'");
 
     /// <summary>Periodos de gts.historicos que se cruzan con el rango (epoch, hora Lima).</summary>
     public async Task<List<Periodo>> PeriodosAsync(long desde, long hasta, CancellationToken ct)
@@ -51,23 +50,6 @@ public sealed partial class GpsRepositorio(Conexiones conexiones)
         return fila.Nombre is null ? (false, null) : (true, fila.Creada);
     }
 
-    public async Task<bool> ExisteTablaAsync(string baseDatos, string tabla, CancellationToken ct)
-    {
-        await using var cn = await conexiones.AbrirDbv16Async(ct);
-        return await cn.ExecuteScalarAsync<long>(new CommandDefinition("""
-            SELECT COUNT(*) FROM information_schema.tables
-             WHERE table_schema = @baseDatos AND table_name = @tabla
-            """, new { baseDatos, tabla }, cancellationToken: ct)) > 0;
-    }
-
-    public async Task<bool> ExisteBaseAsync(string baseDatos, CancellationToken ct)
-    {
-        await using var cn = await conexiones.AbrirDbv16Async(ct);
-        return await cn.ExecuteScalarAsync<long>(new CommandDefinition(
-            "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = @baseDatos",
-            new { baseDatos }, cancellationToken: ct)) > 0;
-    }
-
     /// <summary>CREATE TABLE IF NOT EXISTS dbv16_01.gps_X LIKE gts.eventdata. Devuelve true si la creó.</summary>
     public async Task<bool> CrearTablaDestinoAsync(string tabla, CancellationToken ct)
     {
@@ -81,83 +63,61 @@ public sealed partial class GpsRepositorio(Conexiones conexiones)
         return true;
     }
 
-    public async Task<List<string>> ColumnasAsync(string baseDatos, string tabla, CancellationToken ct)
+    /// <summary>Columnas de dbv16_01.gps_X en orden.</summary>
+    public async Task<List<string>> ColumnasDestinoAsync(string tabla, CancellationToken ct)
     {
         await using var cn = await conexiones.AbrirDbv16Async(ct);
         var cols = await cn.QueryAsync<string>(new CommandDefinition("""
             SELECT COLUMN_NAME FROM information_schema.columns
-             WHERE table_schema = @baseDatos AND table_name = @tabla
+             WHERE table_schema = DATABASE() AND table_name = @tabla
              ORDER BY ORDINAL_POSITION
-            """, new { baseDatos, tabla }, cancellationToken: ct));
+            """, new { tabla }, cancellationToken: ct));
         return cols.ToList();
     }
 
     /// <summary>
-    /// INSERT IGNORE INTO dbv16_01.gps_X (cols) SELECT cols FROM scratch.gps_X WHERE placa/rango.
-    /// Se usa la lista explícita de columnas comunes por si algún dump antiguo difiere de eventdata.
+    /// INSERT IGNORE INTO dbv16_01.gps_X VALUES (...),(...) en lotes, reusando el texto de cada tupla
+    /// tal como viene del dump. Todo va en una transacción: o entran todos los lotes o ninguno.
+    /// La PK descarta los duplicados (INSERT IGNORE). Devuelve las filas efectivamente insertadas.
     /// </summary>
-    public async Task<long> InsertarFiltradoAsync(string baseScratch, string tabla, IReadOnlyList<string> columnas,
-        IReadOnlyList<string> placas, long desde, long hasta, int timeoutSegundos, CancellationToken ct)
+    public async Task<long> InsertarTuplasAsync(string tabla, IEnumerable<string> tuplas, int tuplasPorLote,
+        string? zonaHoraria, int timeoutSegundos, CancellationToken ct)
     {
         Validar(tabla);
-        ValidarBase(baseScratch);
-        var lista = string.Join(", ", columnas.Select(c => $"`{c.Replace("`", "``")}`"));
-        var sql = $"""
-            INSERT IGNORE INTO `{tabla}` ({lista})
-            SELECT {lista} FROM `{baseScratch}`.`{tabla}`
-             WHERE deviceID IN @placas
-               AND `timestamp` BETWEEN @desde AND @hasta
-            """;
+        const int maxCaracteresLote = 2_000_000; // lejos de max_allowed_packet aunque las tuplas sean grandes
+        var prefijo = $"INSERT IGNORE INTO `{tabla}` VALUES ";
 
         await using var cn = await conexiones.AbrirDbv16Async(ct);
-        return await cn.ExecuteAsync(new CommandDefinition(sql, new { placas, desde, hasta },
-            commandTimeout: timeoutSegundos, cancellationToken: ct));
-    }
+        if (zonaHoraria is not null)
+        {
+            // Igual que al importar el dump: sus valores TIMESTAMP están en esa zona (SET TIME_ZONE del dump).
+            await cn.ExecuteAsync(new CommandDefinition("SET time_zone = @zonaHoraria", new { zonaHoraria },
+                cancellationToken: ct));
+        }
 
-    public async Task EliminarTablaScratchAsync(string baseScratch, string tabla, CancellationToken ct)
-    {
-        Validar(tabla);
-        ValidarBase(baseScratch);
-        await using var cn = await conexiones.AbrirDbv16Async(ct);
-        await cn.ExecuteAsync(new CommandDefinition(
-            $"DROP TABLE IF EXISTS `{baseScratch}`.`{tabla}`", cancellationToken: ct));
-    }
+        await using var tx = await cn.BeginTransactionAsync(ct);
+        var sql = new StringBuilder(maxCaracteresLote + 64 * 1024);
+        var enLote = 0;
+        long insertadas = 0;
 
-    /// <summary>
-    /// Deja lista en la base scratch una tabla vacía con la estructura de gts.eventdata, pero sin
-    /// llave primaria ni índices. Algunos dumps (los generados desde MySQL 5.6) no traen CREATE TABLE
-    /// y contienen filas duplicadas; así se importan igual. Si el dump sí trae su CREATE TABLE,
-    /// reemplaza esta tabla. Los duplicados los descarta después el INSERT IGNORE hacia el destino.
-    /// </summary>
-    public async Task PrepararTablaScratchAsync(string baseScratch, string tabla, CancellationToken ct)
-    {
-        Validar(tabla);
-        ValidarBase(baseScratch);
-        await using var cn = await conexiones.AbrirDbv16Async(ct);
-        await cn.ExecuteAsync(new CommandDefinition(
-            $"DROP TABLE IF EXISTS `{baseScratch}`.`{tabla}`", cancellationToken: ct));
-        await cn.ExecuteAsync(new CommandDefinition(
-            $"CREATE TABLE `{baseScratch}`.`{tabla}` LIKE gts.eventdata", cancellationToken: ct));
-        await cn.ExecuteAsync(new CommandDefinition($"""
-            ALTER TABLE `{baseScratch}`.`{tabla}`
-              DROP PRIMARY KEY,
-              DROP INDEX idx_timestamp_account_device
-            """, cancellationToken: ct));
-        // MyISAM acelera la carga (sin transacciones ni redo log). Se cambia con la tabla vacía,
-        // donde es instantáneo; la tabla es de un solo uso y el destino en dbv16_01 sigue en InnoDB.
-        await cn.ExecuteAsync(new CommandDefinition(
-            $"ALTER TABLE `{baseScratch}`.`{tabla}` ENGINE = MyISAM", cancellationToken: ct));
-    }
+        async Task EjecutarLoteAsync()
+        {
+            await using var cmd = new MySqlCommand(sql.ToString(), cn, tx) { CommandTimeout = timeoutSegundos };
+            insertadas += await cmd.ExecuteNonQueryAsync(ct);
+            sql.Clear();
+            enLote = 0;
+        }
 
-    /// <summary>Tablas gps_* que quedaron en la base scratch (por ejemplo tras un reinicio).</summary>
-    public async Task<List<string>> TablasScratchAsync(string baseScratch, CancellationToken ct)
-    {
-        await using var cn = await conexiones.AbrirDbv16Async(ct);
-        var tablas = await cn.QueryAsync<string>(new CommandDefinition("""
-            SELECT TABLE_NAME FROM information_schema.tables
-             WHERE table_schema = @baseScratch AND TABLE_NAME LIKE 'gps\_%'
-            """, new { baseScratch }, cancellationToken: ct));
-        return tablas.Where(NombreTablaValido).ToList();
+        foreach (var tupla in tuplas)
+        {
+            sql.Append(enLote == 0 ? prefijo : ",").Append(tupla);
+            if (++enLote >= tuplasPorLote || sql.Length >= maxCaracteresLote)
+                await EjecutarLoteAsync();
+        }
+        if (enLote > 0) await EjecutarLoteAsync();
+
+        await tx.CommitAsync(ct);
+        return insertadas;
     }
 
     public async Task PingAsync(CancellationToken ct)

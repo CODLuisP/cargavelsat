@@ -13,7 +13,6 @@ namespace RestauracionGps.Servicios;
 public sealed class TrabajadorRestauracion(
     ColaTrabajos cola,
     TrabajosRepositorio trabajos,
-    GpsRepositorio gps,
     Disponibilidad disponibilidad,
     Restaurador restaurador,
     EstadoServicio estadoServicio,
@@ -55,16 +54,7 @@ public sealed class TrabajadorRestauracion(
             try
             {
                 await trabajos.AsegurarEsquemaAsync(ct);
-
-                if (!await gps.ExisteBaseAsync(_opt.BaseScratch, ct))
-                    log.LogError("La base scratch '{Base}' no existe. Crearla según el README antes de restaurar.", _opt.BaseScratch);
-
                 LimpiarDirectorioTemporal();
-                foreach (var tabla in await gps.TablasScratchAsync(_opt.BaseScratch, ct))
-                {
-                    log.LogInformation("Eliminando tabla huérfana {Base}.{Tabla}", _opt.BaseScratch, tabla);
-                    await gps.EliminarTablaScratchAsync(_opt.BaseScratch, tabla, ct);
-                }
 
                 var pendientes = await trabajos.IdsPendientesAsync(ct);
                 foreach (var id in pendientes) cola.Encolar(id);
@@ -87,7 +77,10 @@ public sealed class TrabajadorRestauracion(
     private void LimpiarDirectorioTemporal()
     {
         Directory.CreateDirectory(_opt.DirectorioTemporal);
-        foreach (var f in Directory.EnumerateFiles(_opt.DirectorioTemporal, "*.sql.gz"))
+        var huerfanos = Directory.EnumerateFiles(_opt.DirectorioTemporal, "*.sql.gz")
+            .Concat(Directory.EnumerateFiles(_opt.DirectorioTemporal, "*.tuplas"))
+            .ToList();
+        foreach (var f in huerfanos)
         {
             try
             {

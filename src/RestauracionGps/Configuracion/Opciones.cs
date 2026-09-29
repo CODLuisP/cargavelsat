@@ -33,23 +33,14 @@ public sealed class RestauracionOptions
     /// <summary>Máximo de placas por solicitud.</summary>
     public int MaximoPlacas { get; set; } = 200;
 
-    /// <summary>Base scratch donde se importan los dumps.</summary>
-    public string BaseScratch { get; set; } = "restore_tmp";
-
     /// <summary>Minutos estimados por tabla (solo para el campo estimadoMinutos).</summary>
     public int MinutosPorTabla { get; set; } = 4;
 
-    /// <summary>Tiempo máximo del proceso zcat | mysql por tabla.</summary>
-    public int TimeoutImportacionMinutos { get; set; } = 90;
-
-    /// <summary>Tiempo máximo del INSERT ... SELECT por tabla.</summary>
+    /// <summary>Tiempo máximo de cada lote INSERT hacia dbv16_01.</summary>
     public int TimeoutInsertSegundos { get; set; } = 1800;
 
-    /// <summary>Ejecutable del cliente MySQL dentro del contenedor.</summary>
-    public string MysqlCliente { get; set; } = "mysql";
-
-    /// <summary>Argumentos extra para el cliente mysql (ej. "--skip-ssl" o "--ssl").</summary>
-    public string MysqlArgsExtra { get; set; } = "";
+    /// <summary>Tuplas por sentencia INSERT IGNORE al insertar lo filtrado.</summary>
+    public int TuplasPorLote { get; set; } = 500;
 
     /// <summary>Cantidad por defecto de trabajos en GET /api/restauracion.</summary>
     public int ListadoPorDefecto { get; set; } = 20;

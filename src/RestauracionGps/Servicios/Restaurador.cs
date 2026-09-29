@@ -6,10 +6,12 @@ using RestauracionGps.Dominio;
 
 namespace RestauracionGps.Servicios;
 
-/// <summary>Restaura UNA tabla: descarga, importa en scratch, filtra a dbv16_01 y limpia.</summary>
+/// <summary>
+/// Restaura UNA tabla: descarga el dump, lo lee en streaming quedándose solo con las filas de las
+/// placas y el rango pedidos, y las inserta directo en dbv16_01. No importa el dump completo.
+/// </summary>
 public sealed class Restaurador(
     R2Descargador r2,
-    ImportadorMysql importador,
     GpsRepositorio gps,
     TrabajosRepositorio trabajos,
     IOptions<RestauracionOptions> opt,
@@ -21,13 +23,13 @@ public sealed class Restaurador(
     public async Task<long> RestaurarAsync(Trabajo trabajo, TablaTrabajo t, CancellationToken ct)
     {
         var tabla = t.Tabla;
-        var scratch = _opt.BaseScratch;
         Directory.CreateDirectory(_opt.DirectorioTemporal);
         var archivo = Path.Combine(_opt.DirectorioTemporal, $"{trabajo.Id}_{tabla}.sql.gz");
+        var archivoTuplas = Path.Combine(_opt.DirectorioTemporal, $"{trabajo.Id}_{tabla}.tuplas");
 
         try
         {
-            // a. Descargar
+            // 1. Descargar
             VerificarEspacio();
             await trabajos.ActualizarEstadoTablaAsync(trabajo.Id, t.Orden, EstadoTabla.Descargando, ct);
             var sw = Stopwatch.StartNew();
@@ -35,70 +37,70 @@ public sealed class Restaurador(
             log.LogInformation("[{Job}] {Tabla}: descargado {Mb:F1} MB en {Seg:F0}s",
                 trabajo.Id, tabla, bytes / 1048576.0, sw.Elapsed.TotalSeconds);
 
-            // b. Importar en la base scratch (sin tocar el SQL del dump)
-            await trabajos.ActualizarEstadoTablaAsync(trabajo.Id, t.Orden, EstadoTabla.Importando, ct);
-            await gps.PrepararTablaScratchAsync(scratch, tabla, ct);
-            sw.Restart();
-            await importador.ImportarAsync(archivo, scratch, ct);
-            log.LogInformation("[{Job}] {Tabla}: importado en {Base} en {Seg:F0}s",
-                trabajo.Id, tabla, scratch, sw.Elapsed.TotalSeconds);
-
-            // El archivo ya no hace falta: liberar disco cuanto antes.
-            BorrarArchivo(archivo);
-
-            if (!await gps.ExisteTablaAsync(scratch, tabla, ct))
-                throw new InvalidOperationException(
-                    $"El dump no creó la tabla {scratch}.{tabla} (¿el dump usa otro nombre de tabla?)");
-
-            // c. Crear destino si no existe
-            await trabajos.ActualizarEstadoTablaAsync(trabajo.Id, t.Orden, EstadoTabla.Filtrando, ct);
+            // 2. Crear destino si no existe
             if (await gps.CrearTablaDestinoAsync(tabla, ct))
             {
                 await trabajos.MarcarTablaCreadaAsync(trabajo.Id, t.Orden, ct);
                 log.LogInformation("[{Job}] {Tabla}: creada en {Base} (LIKE gts.eventdata)", trabajo.Id, tabla, gps.BaseDestino);
             }
+            var columnas = await gps.ColumnasDestinoAsync(tabla, ct);
+            if (columnas.Count < 3 ||
+                !columnas[1].Equals("deviceID", StringComparison.OrdinalIgnoreCase) ||
+                !columnas[2].Equals("timestamp", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException(
+                    $"{gps.BaseDestino}.{tabla} no tiene deviceID y timestamp como columnas 2 y 3: [{string.Join(",", columnas.Take(4))}...]");
 
-            // d. Insertar solo lo pedido
-            var columnas = await ColumnasComunesAsync(trabajo.Id, scratch, tabla, ct);
+            // 3-5. Leer el dump en streaming y quedarse solo con lo pedido.
+            // Las tuplas aceptadas van a un archivo: no se inserta nada hasta validar el dump completo.
+            await trabajos.ActualizarEstadoTablaAsync(trabajo.Id, t.Orden, EstadoTabla.Importando, ct);
             sw.Restart();
-            var filas = await gps.InsertarFiltradoAsync(scratch, tabla, columnas, trabajo.Placas,
-                trabajo.TsDesde, trabajo.TsHasta, _opt.TimeoutInsertSegundos, ct);
-            log.LogInformation("[{Job}] {Tabla}: {Filas} filas insertadas en {Seg:F0}s",
-                trabajo.Id, tabla, filas, sw.Elapsed.TotalSeconds);
+            ResultadoLectura lectura;
+            using (var salida = new ArchivoTuplas(archivoTuplas))
+            await using (var gz = new FileStream(archivo, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, useAsync: true))
+            {
+                var lector = new LectorDumpSql(tabla, trabajo.Placas, trabajo.TsDesde, trabajo.TsHasta,
+                    columnas.Count, salida.Agregar);
+                lectura = await lector.LeerGzAsync(gz, l => log.LogInformation(
+                    "[{Job}] {Tabla}: leídos {Gb:F1} GB, {Tuplas} tuplas, {Filtradas} aceptadas",
+                    trabajo.Id, tabla, l.BytesProcesados / 1073741824.0, l.TuplasTotales, l.TuplasFiltradas), ct);
+            }
+            var segLectura = sw.Elapsed.TotalSeconds;
+            log.LogInformation(
+                "[{Job}] {Tabla}: dump leído en {Seg:F0}s ({Mb:F0} MB descomprimidos, {Vel:F0} MB/s). " +
+                "Sentencias INSERT: {Sentencias}. Tuplas totales: {Tuplas}. Pasaron el filtro: {Filtradas}. " +
+                "Charset: {Charset}. Zona: {Zona}",
+                trabajo.Id, tabla, segLectura, lectura.BytesDescomprimidos / 1048576.0,
+                lectura.BytesDescomprimidos / 1048576.0 / Math.Max(0.001, segLectura),
+                lectura.SentenciasInsert, lectura.TuplasTotales, lectura.TuplasFiltradas,
+                lectura.Charset, lectura.ZonaHoraria ?? "-");
+            if (lectura.TuplasOtrasTablas > 0)
+                log.LogWarning("[{Job}] {Tabla}: el dump trae además {N} tuplas de otras tablas (ignoradas)",
+                    trabajo.Id, tabla, lectura.TuplasOtrasTablas);
+            if (lectura.SentenciasInsert == 0)
+                log.LogWarning("[{Job}] {Tabla}: el dump no contiene ninguna sentencia INSERT", trabajo.Id, tabla);
+
+            // El .sql.gz ya no hace falta: liberar disco cuanto antes.
+            BorrarArchivo(archivo);
+
+            // 6. Insertar las tuplas aceptadas en dbv16_01
+            await trabajos.ActualizarEstadoTablaAsync(trabajo.Id, t.Orden, EstadoTabla.Filtrando, ct);
+            sw.Restart();
+            var filas = lectura.TuplasFiltradas == 0
+                ? 0
+                : await gps.InsertarTuplasAsync(tabla,
+                    ArchivoTuplas.Leer(archivoTuplas, lectura.Codificacion, lectura.Charset),
+                    _opt.TuplasPorLote, lectura.ZonaHoraria, _opt.TimeoutInsertSegundos, ct);
+            log.LogInformation(
+                "[{Job}] {Tabla}: {Filas} filas insertadas en {Seg:F1}s ({Omitidas} de {Filtradas} ya existían o eran duplicadas)",
+                trabajo.Id, tabla, filas, sw.Elapsed.TotalSeconds, lectura.TuplasFiltradas - filas, lectura.TuplasFiltradas);
             return filas;
         }
         finally
         {
-            // e. Limpiar SIEMPRE, aunque algo falle o se cancele.
+            // 7. Limpiar SIEMPRE, aunque algo falle o se cancele.
             BorrarArchivo(archivo);
-            try
-            {
-                await gps.EliminarTablaScratchAsync(scratch, tabla, CancellationToken.None);
-            }
-            catch (Exception ex)
-            {
-                log.LogWarning(ex, "[{Job}] No se pudo eliminar {Base}.{Tabla}", trabajo.Id, scratch, tabla);
-            }
+            BorrarArchivo(archivoTuplas);
         }
-    }
-
-    private async Task<List<string>> ColumnasComunesAsync(string jobId, string scratch, string tabla, CancellationToken ct)
-    {
-        var origen = await gps.ColumnasAsync(scratch, tabla, ct);
-        var destino = await gps.ColumnasAsync(gps.BaseDestino, tabla, ct);
-        var enOrigen = new HashSet<string>(origen, StringComparer.OrdinalIgnoreCase);
-        var comunes = destino.Where(enOrigen.Contains).ToList();
-
-        if (comunes.Count != origen.Count || comunes.Count != destino.Count)
-            log.LogWarning("[{Job}] {Tabla}: estructura distinta a eventdata. Solo en dump: [{SoloOrigen}]. Solo en destino: [{SoloDestino}]",
-                jobId, tabla,
-                string.Join(",", origen.Except(destino, StringComparer.OrdinalIgnoreCase)),
-                string.Join(",", destino.Except(origen, StringComparer.OrdinalIgnoreCase)));
-
-        if (!comunes.Contains("deviceID", StringComparer.OrdinalIgnoreCase) ||
-            !comunes.Contains("timestamp", StringComparer.OrdinalIgnoreCase))
-            throw new InvalidOperationException($"La tabla {scratch}.{tabla} no tiene columnas deviceID/timestamp");
-        return comunes;
     }
 
     private void VerificarEspacio()

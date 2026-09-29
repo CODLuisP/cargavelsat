@@ -9,10 +9,10 @@ RUN dotnet publish RestauracionGps/RestauracionGps.csproj -c Release -o /app --n
 # ---------- runtime ----------
 FROM mcr.microsoft.com/dotnet/aspnet:8.0
 
-# mysql-client y gzip: necesarios para importar los dumps (gzip -dc | mysql).
 # tzdata: zona America/Lima. curl: healthcheck.
+# (Los dumps se leen con GZipStream dentro de .NET: no hace falta mysql-client ni gzip.)
 RUN apt-get update \
- && apt-get install -y --no-install-recommends default-mysql-client gzip tzdata curl \
+ && apt-get install -y --no-install-recommends tzdata curl \
  && rm -rf /var/lib/apt/lists/*
 
 ENV TZ=America/Lima \
